@@ -1,0 +1,5 @@
+streamlit
+pandas
+openpyxl  # Required for pandas to read the .xlsx file
+altair
+numpy     # Included for robust DataFrame operations
