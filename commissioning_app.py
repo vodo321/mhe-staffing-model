@@ -53,7 +53,7 @@ def load_inputs_from_excel(excel_source):
         "CE": "CE_Assumptions",
         "ME": "ME_Assumptions",
         "EE": "EE_Assumptions",
-        "SITEOPS": "SITEOPS_Assumptions",  # Renamed from SAFETY
+        "SITEOPS": "SITEOPS_Assumptions",
         "LEAD": "LEAD_Assumptions"
     }
 
@@ -152,11 +152,10 @@ def build_monthly_labor_detailed(por: pd.DataFrame,
     if staff_col not in assumptions_idx.columns:
         return {}
 
-    monthly_by_scen = {}  # Initialize dictionary
+    monthly_by_scen = {}
 
     scen_to_use = selected_scen_name if selected_scen_name != 'HYBRID' else fallback_scen_name
 
-    # Safety check: if scenario doesn't exist, default to first available
     if scen_to_use not in scenarios['ScenarioName'].values:
         scen_to_use = scenarios['ScenarioName'].iloc[0]
 
@@ -299,8 +298,6 @@ def build_por_summary(por: pd.DataFrame):
 
 def build_consolidated_report(por_summary_df, annual_summaries: dict, selected_scen):
     df = por_summary_df.copy()
-
-    # Updated list of all prefixes (Replaced SAFETY with SITEOPS)
     all_prefixes = ["CE", "ME", "EE", "SITEOPS", "LEAD"]
 
     for prefix in all_prefixes:
@@ -341,7 +338,6 @@ def build_consolidated_report(por_summary_df, annual_summaries: dict, selected_s
         "EE_Internal": ("EE", "Internal_Base"),
         "EE_Peak": ("EE", "Peak_FTE"),
         "EE_Contractor": ("EE", "Contractor_Need"),
-        # Updated SITEOPS tuples
         "SITEOPS_Internal": ("SITEOPS", "Internal_Base"),
         "SITEOPS_Peak": ("SITEOPS", "Peak_FTE"),
         "SITEOPS_Contractor": ("SITEOPS", "Contractor_Need"),
@@ -408,7 +404,6 @@ def build_peak_headcount_by_program_table(results: dict, disciplines_map: dict):
 
 def build_headcount_by_team_table(results: dict, baseline_method, baseline_quantile):
     team_data = {}
-
     non_ce_disciplines = ["Mechanical Engineer", "Electrical Engineer", "Site Operations", "Site Lead"]
 
     # --- 1. SIF Team (Commissioning Engineer) ---
@@ -428,7 +423,6 @@ def build_headcount_by_team_table(results: dict, baseline_method, baseline_quant
     if df_non_ce_monthly_list:
         df_combined_monthly = pd.concat(df_non_ce_monthly_list, ignore_index=True)
 
-        # --- FIXED: Loose Matching for ARS/SSD to catch variations ---
         def map_to_team(btype):
             s = str(btype).upper()
             if "ARS" in s:
@@ -437,7 +431,7 @@ def build_headcount_by_team_table(results: dict, baseline_method, baseline_quant
                 return "SSD Team"
             elif "IBIS" in s or "AUTOSTORE" in s:
                 return "Projects Team (IBIS/Autostore)"
-            return None  # Ignore other types
+            return None
 
         df_combined_monthly["Team"] = df_combined_monthly["BuildingType"].apply(map_to_team)
 
@@ -476,7 +470,6 @@ def build_project_master_list(por: pd.DataFrame, known_dates: pd.DataFrame, scen
                               fallback_scen_name: str):
     master_list_rows = []
 
-    # Safety Check: If fallback_scen_name is invalid, use first available
     if fallback_scen_name not in scenarios['ScenarioName'].values:
         fallback_scen_name = scenarios['ScenarioName'].iloc[0]
 
@@ -535,6 +528,42 @@ def build_project_master_list(por: pd.DataFrame, known_dates: pd.DataFrame, scen
     return final_df[['Building Type', 'Project ID', 'Go-Live Date', 'Source']].sort_values('Go-Live Date')
 
 
+# NEW FUNCTION: Build Aggregated Monthly Data for Charting
+def build_team_monthly_data(results: dict):
+    all_dfs = []
+
+    # 1. System Integration
+    if "Commissioning Engineer" in results and results["Commissioning Engineer"] is not None:
+        df = results["Commissioning Engineer"].copy()
+        df["Team"] = "System Integration"
+        all_dfs.append(df[["Month", "Team", "FTE"]])
+
+    # 2. ARS, SSD, Projects
+    non_ce_disciplines = ["Mechanical Engineer", "Electrical Engineer", "Site Operations", "Site Lead"]
+    for label in non_ce_disciplines:
+        if label in results and results[label] is not None:
+            df = results[label].copy()
+
+            def map_to_team(btype):
+                s = str(btype).upper()
+                if "ARS" in s: return "ARS"
+                if "SSD" in s: return "SSD"
+                if "IBIS" in s or "AUTOSTORE" in s: return "Projects"
+                return "Other"
+
+            df["Team"] = df["BuildingType"].apply(map_to_team)
+            # Filter out 'Other' if necessary, or keep it
+            all_dfs.append(df[["Month", "Team", "FTE"]])
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    full_df = pd.concat(all_dfs, ignore_index=True)
+    # Group by Month and Team
+    grouped_df = full_df.groupby(["Month", "Team"], as_index=False)["FTE"].sum()
+    return grouped_df
+
+
 # ---------------------------------------------------
 # STREAMLIT APP MAIN FUNCTION
 # ---------------------------------------------------
@@ -565,8 +594,6 @@ def main():
     # ---------------- Sidebar: Filters ----------------
     st.sidebar.header("2. Configuration")
 
-    # --- FIXED: CLEAN DROP DOWN OPTIONS ---
-    # Remove NaNs and empty strings from scenario list
     raw_options = scenarios["ScenarioName"].dropna().unique()
     scenario_options = [x for x in raw_options if str(x).strip() != ""]
 
@@ -578,9 +605,6 @@ def main():
     fallback_choice = None
     if selected_scen == 'HYBRID':
         st.sidebar.markdown('**Hybrid Fallback:**')
-
-        # --- FIXED: ROBUST FALLBACK SELECTION ---
-        # Default to LEVEL_LOAD only if it exists, otherwise use first available
         fallback_options = [x for x in scenarios["ScenarioName"].dropna().unique() if str(x).strip() != ""]
         default_index = 0
         if "LEVEL_LOAD" in fallback_options:
@@ -611,7 +635,7 @@ def main():
         "Commissioning Engineer": ("CE", "CE"),
         "Mechanical Engineer": ("ME", "ME"),
         "Electrical Engineer": ("EE", "EE"),
-        "Site Operations": ("SITEOPS", "SITEOPS"),  # Renamed key and prefix
+        "Site Operations": ("SITEOPS", "SITEOPS"),
         "Site Lead": ("LEAD", "LEAD"),
     }
 
@@ -640,6 +664,31 @@ def main():
 
     st.markdown("---")
 
+    # ---------------- TOTAL HEADCOUNT CHART ----------------
+    st.header("Total Headcount by Team (Graph)")
+    team_monthly_df = build_team_monthly_data(results)
+
+    if not team_monthly_df.empty:
+        # Create a selection for interactivity
+        selection = alt.selection_point(fields=['Team'], bind='legend')
+
+        chart_team = alt.Chart(team_monthly_df).mark_area().encode(
+            x='Month',
+            y='FTE',
+            color=alt.Color('Team', scale=alt.Scale(scheme='category10')),
+            tooltip=['Month', 'Team', 'FTE'],
+            opacity=alt.condition(selection, alt.value(1), alt.value(0.2))
+        ).add_params(
+            selection
+        ).properties(
+            height=400
+        )
+        st.altair_chart(chart_team, use_container_width=True)
+    else:
+        st.info("No data available for team graphing.")
+
+    st.markdown("---")
+
     # ---------------- PROJECT MASTER LIST ----------------
     st.header("Project Master List (POR Detail)")
     st.caption("Detailed view of all scheduled projects. Known dates are prioritized; others are forecasted.")
@@ -654,7 +703,7 @@ def main():
     st.markdown("---")
 
     # ---------------- HEADCOUNT BY ORGANIZATIONAL TEAM ----------------
-    st.header("Headcount by Organizational Team")
+    st.header("Headcount by Organizational Team (Table)")
     team_headcount_df = build_headcount_by_team_table(results, baseline_method, baseline_quantile)
     if not team_headcount_df.empty:
         st.dataframe(team_headcount_df.style.format("{:.1f}"), use_container_width=True)
@@ -670,7 +719,7 @@ def main():
     st.markdown("---")
 
     # ---------------- Monthly Demand Charts ----------------
-    st.subheader("Monthly Demand Visuals")
+    st.subheader("Monthly Demand Visuals (Detailed)")
     for label, df_monthly in results.items():
         if df_monthly is None or df_monthly.empty: continue
         st.markdown(f"### {label} FTE Demand")
