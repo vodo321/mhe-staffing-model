@@ -1,7 +1,6 @@
 import pandas as pd
 import streamlit as st
 import altair as alt
-from pathlib import Path
 
 # Set Streamlit page config
 st.set_page_config(page_title="MHE Staffing Consolidated Demand", layout="wide")
@@ -35,7 +34,8 @@ def load_inputs_from_excel(excel_source):
             known_dates['Go-Live Date'] = pd.to_datetime(known_dates['Go-Live Date'])
 
             # Ensure required columns exist
-            known_dates['Year'] = known_dates['Go-Live Date'].dt.year
+            if 'Year' not in known_dates.columns:
+                known_dates['Year'] = known_dates['Go-Live Date'].dt.year
             if 'Project_ID' not in known_dates.columns:
                 known_dates['Project_ID'] = known_dates['BuildingType'] + '-' + known_dates['Year'].astype(
                     str) + '-ID-' + (known_dates.index + 1).astype(str)
@@ -150,12 +150,16 @@ def build_monthly_labor_detailed(por: pd.DataFrame,
     lead_col = f"{prefix}_Lead_Months"
 
     if staff_col not in assumptions_idx.columns:
-        # Fallback logic if specific column is missing (try generic or skip)
         return {}
 
     monthly_by_scen = {}  # Initialize dictionary
 
     scen_to_use = selected_scen_name if selected_scen_name != 'HYBRID' else fallback_scen_name
+
+    # Safety check: if scenario doesn't exist, default to first available
+    if scen_to_use not in scenarios['ScenarioName'].values:
+        scen_to_use = scenarios['ScenarioName'].iloc[0]
+
     scenario_row = scenarios[scenarios['ScenarioName'] == scen_to_use].iloc[0]
     q_shares = {k: scenario_row.get(f"{k}_Share", 0.0) for k in ["Q1", "Q2", "Q3", "Q4"]}
 
@@ -405,7 +409,6 @@ def build_peak_headcount_by_program_table(results: dict, disciplines_map: dict):
 def build_headcount_by_team_table(results: dict, baseline_method, baseline_quantile):
     team_data = {}
 
-    # Replaced "Safety Engineer" with "Site Operations"
     non_ce_disciplines = ["Mechanical Engineer", "Electrical Engineer", "Site Operations", "Site Lead"]
 
     # --- 1. SIF Team (Commissioning Engineer) ---
@@ -425,14 +428,16 @@ def build_headcount_by_team_table(results: dict, baseline_method, baseline_quant
     if df_non_ce_monthly_list:
         df_combined_monthly = pd.concat(df_non_ce_monthly_list, ignore_index=True)
 
+        # --- FIXED: Loose Matching for ARS/SSD to catch variations ---
         def map_to_team(btype):
-            if btype == "ARS":
+            s = str(btype).upper()
+            if "ARS" in s:
                 return "ARS Team"
-            elif btype == "SSD":
+            elif "SSD" in s:
                 return "SSD Team"
-            elif btype in ["IBIS", "Autostore"]:
+            elif "IBIS" in s or "AUTOSTORE" in s:
                 return "Projects Team (IBIS/Autostore)"
-            return None
+            return None  # Ignore other types
 
         df_combined_monthly["Team"] = df_combined_monthly["BuildingType"].apply(map_to_team)
 
@@ -470,6 +475,10 @@ def build_headcount_by_team_table(results: dict, baseline_method, baseline_quant
 def build_project_master_list(por: pd.DataFrame, known_dates: pd.DataFrame, scenarios: pd.DataFrame,
                               fallback_scen_name: str):
     master_list_rows = []
+
+    # Safety Check: If fallback_scen_name is invalid, use first available
+    if fallback_scen_name not in scenarios['ScenarioName'].values:
+        fallback_scen_name = scenarios['ScenarioName'].iloc[0]
 
     fallback_row = scenarios[scenarios['ScenarioName'] == fallback_scen_name].iloc[0]
     q_shares = {k: fallback_row.get(f"{k}_Share", 0.0) for k in ["Q1", "Q2", "Q3", "Q4"]}
@@ -556,7 +565,11 @@ def main():
     # ---------------- Sidebar: Filters ----------------
     st.sidebar.header("2. Configuration")
 
-    scenario_options = list(scenarios["ScenarioName"].unique())
+    # --- FIXED: CLEAN DROP DOWN OPTIONS ---
+    # Remove NaNs and empty strings from scenario list
+    raw_options = scenarios["ScenarioName"].dropna().unique()
+    scenario_options = [x for x in raw_options if str(x).strip() != ""]
+
     if not known_dates.empty:
         scenario_options.insert(0, "HYBRID")
 
@@ -565,12 +578,19 @@ def main():
     fallback_choice = None
     if selected_scen == 'HYBRID':
         st.sidebar.markdown('**Hybrid Fallback:**')
+
+        # --- FIXED: ROBUST FALLBACK SELECTION ---
+        # Default to LEVEL_LOAD only if it exists, otherwise use first available
+        fallback_options = [x for x in scenarios["ScenarioName"].dropna().unique() if str(x).strip() != ""]
+        default_index = 0
+        if "LEVEL_LOAD" in fallback_options:
+            default_index = list(fallback_options).index("LEVEL_LOAD")
+
         fallback_choice = st.sidebar.selectbox(
             "Select Fallback Schedule",
-            options=list(scenarios["ScenarioName"].unique())
+            options=fallback_options,
+            index=default_index
         )
-        if known_dates.empty:
-            fallback_choice = 'LEVEL_LOAD'
     else:
         fallback_choice = selected_scen
 
@@ -587,7 +607,6 @@ def main():
         filtered_scenarios = scenarios[scenarios["ScenarioName"] == fallback_choice].copy()
 
     # ---------------- Processing ----------------
-    # Updated mapping: "Safety Engineer" -> "Site Operations"
     disciplines_map = {
         "Commissioning Engineer": ("CE", "CE"),
         "Mechanical Engineer": ("ME", "ME"),
