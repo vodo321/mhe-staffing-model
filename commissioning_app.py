@@ -27,13 +27,10 @@ def load_inputs_from_excel(excel_source):
         # Load KNOWN_DATES Sheet (if it exists)
         if "KNOWN_DATES" in xl.sheet_names:
             known_dates = pd.read_excel(xl, sheet_name="KNOWN_DATES")
-            # RENAME COLUMN IF USER KEPT 'Start_Date' by mistake
             if 'Start_Date' in known_dates.columns and 'Go-Live Date' not in known_dates.columns:
                 known_dates = known_dates.rename(columns={'Start_Date': 'Go-Live Date'})
-
             known_dates['Go-Live Date'] = pd.to_datetime(known_dates['Go-Live Date'])
 
-            # Ensure required columns exist
             if 'Year' not in known_dates.columns:
                 known_dates['Year'] = known_dates['Go-Live Date'].dt.year
             if 'Project_ID' not in known_dates.columns:
@@ -47,14 +44,15 @@ def load_inputs_from_excel(excel_source):
             st.error(f"Error loading core sheets: {e}")
             raise e
 
-    # Load Discipline Assumption Sheets (Updated for SiteOps)
+    # Load Discipline Assumption Sheets
     assumptions_dict = {}
     sheets_to_load = {
         "CE": "CE_Assumptions",
         "ME": "ME_Assumptions",
         "EE": "EE_Assumptions",
         "SITEOPS": "SITEOPS_Assumptions",
-        "LEAD": "LEAD_Assumptions"
+        "LEAD": "LEAD_Assumptions",
+        "INSTALL": "Install_Assumptions"
     }
 
     for key, sheet_name in sheets_to_load.items():
@@ -68,7 +66,6 @@ def load_inputs_from_excel(excel_source):
 
 
 def build_efficiency_map(assumptions_df: pd.DataFrame, years):
-    """Calculates efficiency factors based on annual improvement."""
     eff = {}
     req_cols = ["BuildingType", "Baseline_Year", "Annual_Efficiency_Improvement"]
     if not all(col in assumptions_df.columns for col in req_cols):
@@ -92,9 +89,7 @@ def build_efficiency_map(assumptions_df: pd.DataFrame, years):
 
 
 def assign_go_live_months_quarter_based(count, year, q_shares):
-    """Distributes annual project count into monthly start dates based on quarterly share."""
     if count <= 0: return []
-
     quarter_months = {"Q1": (1, 3), "Q2": (4, 6), "Q3": (7, 9), "Q4": (10, 12)}
     quarters = ["Q1", "Q2", "Q3", "Q4"]
     q_counts = {}
@@ -125,7 +120,6 @@ def assign_go_live_months_quarter_based(count, year, q_shares):
                 target_month = start_m + int(k * step)
                 if target_month > end_m: target_month = end_m
                 months.append((year, target_month))
-
     return months
 
 
@@ -136,8 +130,12 @@ def build_monthly_labor_detailed(por: pd.DataFrame,
                                  known_dates: pd.DataFrame,
                                  fallback_scen_name: str,
                                  selected_scen_name: str):
-    year_cols = [c for c in por.columns if str(c).isdigit()]
-    years = [int(y) for y in year_cols]
+    # Robust Year Identification
+    year_map = {}
+    for c in por.columns:
+        if str(c).isdigit():
+            year_map[int(c)] = c
+    years = sorted(year_map.keys())
 
     if not years or assumptions_df.empty:
         return {}
@@ -153,7 +151,6 @@ def build_monthly_labor_detailed(por: pd.DataFrame,
         return {}
 
     monthly_by_scen = {}
-
     scen_to_use = selected_scen_name if selected_scen_name != 'HYBRID' else fallback_scen_name
 
     if scen_to_use not in scenarios['ScenarioName'].values:
@@ -163,8 +160,6 @@ def build_monthly_labor_detailed(por: pd.DataFrame,
     q_shares = {k: scenario_row.get(f"{k}_Share", 0.0) for k in ["Q1", "Q2", "Q3", "Q4"]}
 
     rows = []
-
-    # Map known dates
     known_dates_map = {}
     if not known_dates.empty:
         for _, kd_row in known_dates.iterrows():
@@ -187,52 +182,38 @@ def build_monthly_labor_detailed(por: pd.DataFrame,
         if staff_per_launch == 0: continue
 
         for y in years:
-            launches = row[str(y)]
+            actual_col = year_map[y]
+            launches = row[actual_col]
             if pd.isna(launches) or launches == 0: continue
             launches = int(launches)
 
             go_live_months = assign_go_live_months_quarter_based(launches, int(y), q_shares)
 
-            project_details = []
-
             known_launches = known_dates_map.get((btype, int(y)), [])
             num_known = len(known_launches)
 
-            # 1. Known Projects
+            project_details = []
             for i in range(num_known):
                 known_id, go_live_date = known_launches[i]
-                project_details.append({
-                    'Go_Live_Date': go_live_date,
-                    'Project_ID': known_id
-                })
-
-            # 2. Unknown Projects
+                project_details.append({'Go_Live_Date': go_live_date, 'Project_ID': known_id})
             for i in range(num_known, launches):
                 if i >= len(go_live_months): continue
-
                 gy, gm = go_live_months[i]
                 go_live_date = pd.Timestamp(year=gy, month=gm, day=1)
                 dummy_id = f"{btype}-{y}-{i + 1}"
-
-                project_details.append({
-                    'Go_Live_Date': go_live_date,
-                    'Project_ID': dummy_id
-                })
+                project_details.append({'Go_Live_Date': go_live_date, 'Project_ID': dummy_id})
 
             for detail in project_details:
                 go_live_date = detail['Go_Live_Date']
                 project_id = detail['Project_ID']
-
                 start_date = go_live_date - pd.DateOffset(months=lead_time)
                 end_date = start_date + pd.DateOffset(months=duration - 1)
-
                 proj_months = pd.date_range(start=start_date, end=end_date, freq="MS")
 
                 for dt in proj_months:
                     yr = dt.year
                     eff = eff_map.get((btype, yr), 1.0)
                     fte = staff_per_launch * eff
-
                     rows.append({
                         "Scenario": selected_scen_name,
                         "Month": dt,
@@ -242,233 +223,239 @@ def build_monthly_labor_detailed(por: pd.DataFrame,
                         "Project_ID": project_id
                     })
 
-        if rows:
-            df = pd.DataFrame(rows)
-            df_agg = (
-                df.groupby(["Month", "BuildingType", "Scenario"], as_index=False)
-                .agg({"FTE": "sum", "Active_Projects": "sum"})
-                .sort_values("Month")
-            )
-        else:
-            df_agg = pd.DataFrame(columns=["Month", "BuildingType", "FTE", "Active_Projects", "Scenario"])
+    if rows:
+        df = pd.DataFrame(rows)
+        df_agg = df.groupby(["Month", "BuildingType", "Scenario"], as_index=False).agg(
+            {"FTE": "sum", "Active_Projects": "sum"}).sort_values("Month")
+    else:
+        df_agg = pd.DataFrame(columns=["Month", "BuildingType", "FTE", "Active_Projects", "Scenario"])
 
-        monthly_by_scen[selected_scen_name] = df_agg
-
+    monthly_by_scen[selected_scen_name] = df_agg
     return monthly_by_scen
 
 
-def build_total_annual_summary(monthly_df, baseline_method, baseline_quantile):
-    """Calculates staffing metrics based on the user's definition."""
-    if monthly_df.empty:
-        return pd.DataFrame()
+# --- SPLIT INTO TABLES (SUMMARY, DETAIL-TEAM, DETAIL-BUILDING) ---
+def build_split_matrices(results, baseline_quantile):
+    summary_rows = []
+    detail_team_rows = []
 
-    total_df = monthly_df.groupby("Month", as_index=False)["FTE"].sum()
-    total_df["Year"] = total_df["Month"].dt.year
-
-    rows = []
-    for year, series in total_df.groupby("Year")["FTE"]:
-        peak_fte = series.max()
-        avg_fte = series.mean()
-
-        if baseline_method == "avg":
-            internal_baseline = avg_fte
-        else:
-            internal_baseline = peak_fte * baseline_quantile
-
-        contractor_fte = max(peak_fte - internal_baseline, 0.0)
-
-        rows.append({
-            "Year": int(year),
-            "Avg_FTE": avg_fte,
-            "Internal_Base": internal_baseline,
-            "Total_Peak": peak_fte,
-            "Contractor_Peak": contractor_fte,
-        })
-
-    return pd.DataFrame(rows).set_index("Year")
-
-
-def build_por_summary(por: pd.DataFrame):
-    """Summarizes total launches per year from the POR."""
-    year_cols = [c for c in por.columns if str(c).isdigit()]
-    por_melt = por.melt(id_vars=["BuildingType"], value_vars=year_cols, var_name="Year", value_name="Launches")
-    por_melt["Year"] = por_melt["Year"].astype(int)
-    return por_melt.groupby("Year")["Launches"].sum().reset_index().rename(columns={"Launches": "Total_Launches"})
-
-
-def build_consolidated_report(por_summary_df, annual_summaries: dict, selected_scen):
-    df = por_summary_df.copy()
-    all_prefixes = ["CE", "ME", "EE", "SITEOPS", "LEAD"]
-
-    for prefix in all_prefixes:
-        if prefix in annual_summaries and not annual_summaries[prefix].empty:
-            annual_df = annual_summaries[prefix].reset_index()[
-                ["Year", "Total_Peak", "Internal_Base", "Contractor_Peak", "Avg_FTE"]]
-
-            annual_df = annual_df.rename(columns={
-                "Total_Peak": f"{prefix}_Peak",
-                "Internal_Base": f"{prefix}_Internal",
-                "Contractor_Peak": f"{prefix}_Contractor",
-                "Avg_FTE": f"{prefix}_Avg"
-            })
-
-            annual_df["Year"] = annual_df["Year"].astype(int)
-            df = pd.merge(df, annual_df, on="Year", how="left")
-
-    df["Scenario"] = selected_scen
-    df = df.set_index("Year").fillna(0)
-
-    desired_cols = ["Total_Launches"]
-    for prefix in all_prefixes:
-        desired_cols.extend([f"{prefix}_Internal", f"{prefix}_Peak", f"{prefix}_Contractor"])
-
-    df = df[df.columns.intersection(desired_cols)]
-
-    # DYNAMIC MultiIndex Construction
-    new_cols_dynamic = []
-
-    col_to_tuple = {
-        "Total_Launches": ("POR", "Total_Launches"),
-        "CE_Internal": ("CE", "Internal_Base"),
-        "CE_Peak": ("CE", "Peak_FTE"),
-        "CE_Contractor": ("CE", "Contractor_Need"),
-        "ME_Internal": ("ME", "Internal_Base"),
-        "ME_Peak": ("ME", "Peak_FTE"),
-        "ME_Contractor": ("ME", "Contractor_Need"),
-        "EE_Internal": ("EE", "Internal_Base"),
-        "EE_Peak": ("EE", "Peak_FTE"),
-        "EE_Contractor": ("EE", "Contractor_Need"),
-        "SITEOPS_Internal": ("SITEOPS", "Internal_Base"),
-        "SITEOPS_Peak": ("SITEOPS", "Peak_FTE"),
-        "SITEOPS_Contractor": ("SITEOPS", "Contractor_Need"),
-        "LEAD_Internal": ("LEAD", "Internal_Base"),
-        "LEAD_Peak": ("LEAD", "Peak_FTE"),
-        "LEAD_Contractor": ("LEAD", "Contractor_Need"),
+    disc_map = {
+        "Commissioning Engineer": "CE",
+        "Mechanical Engineer": "ME",
+        "Electrical Engineer": "EE",
+        "Site Operations": "Ops Lead",
+        "Site Lead": "Site Lead",
+        "Installation": "Installers"
     }
 
-    for col in df.columns:
-        if col in col_to_tuple:
-            new_cols_dynamic.append(col_to_tuple[col])
+    def get_team(label, btype):
+        if label == "Commissioning Engineer": return "System Integration"
+        s = str(btype).upper()
+        if "ARS" in s:
+            return "ARS Team"
+        elif "SSD" in s:
+            return "SSD Team"
+        elif "IBIS" in s or "AUTOSTORE" in s:
+            return "Projects Team"
+        return "Other"
 
-    df.columns = pd.MultiIndex.from_tuples(new_cols_dynamic)
+    # Process results
+    for label, df_monthly in results.items():
+        if df_monthly is None or df_monthly.empty: continue
 
-    # ADD ROW TOTALS
-    df[("TOTAL", "Internal_Base")] = df.loc[:, (slice(None), 'Internal_Base')].sum(axis=1)
-    df[("TOTAL", "Peak_FTE")] = df.loc[:, (slice(None), 'Peak_FTE')].sum(axis=1)
-    df[("TOTAL", "Contractor_Need")] = df.loc[:, (slice(None), 'Contractor_Need')].sum(axis=1)
+        display_role = disc_map.get(label, label)
 
-    return df
+        df_work = df_monthly.copy()
+        df_work["Team"] = df_work.apply(lambda r: get_team(label, r["BuildingType"]), axis=1)
+        df_work["Year"] = df_work["Month"].dt.year
+
+        # Calculate Peak FTE per Year/Team/Role
+        monthly_sum = df_work.groupby(["Year", "Month", "Team"], as_index=False)["FTE"].sum()
+        annual_peaks = monthly_sum.groupby(["Year", "Team"], as_index=False)["FTE"].max()
+
+        for _, row in annual_peaks.iterrows():
+            year = row["Year"]
+            team = row["Team"]
+            peak_fte = row["FTE"]
+
+            # SPLIT LOGIC
+            if display_role == "Installers":
+                internal_fte = 0
+                contractor_fte = peak_fte
+            else:
+                internal_fte = peak_fte * baseline_quantile
+                contractor_fte = peak_fte - internal_fte
+
+            # --- 1. POPULATE SUMMARY DATA (Category Sums) ---
+            if internal_fte > 0.05:
+                summary_rows.append({"Category": "Total Internal", "Year": year, "FTE": internal_fte})
+            if contractor_fte > 0.05:
+                summary_rows.append({"Category": "Total Contractors", "Year": year, "FTE": contractor_fte})
+
+            # --- 2. POPULATE DETAIL DATA (Team/Role) ---
+            # Internal Portion
+            if internal_fte > 0.05:
+                detail_team_rows.append({
+                    "Team": team,
+                    "Role": display_role,
+                    "Year": year,
+                    "FTE": internal_fte
+                })
+            # Contractor Portion (Specific Role logic)
+            if contractor_fte > 0.05:
+                c_role = "Installers" if display_role == "Installers" else "Internal Contractors"
+                detail_team_rows.append({
+                    "Team": team,
+                    "Role": c_role,
+                    "Year": year,
+                    "FTE": contractor_fte
+                })
+
+    # --- BUILD TABLE 1: SUMMARY ---
+    if summary_rows:
+        sum_df = pd.DataFrame(summary_rows)
+        sum_matrix = sum_df.pivot_table(index="Category", columns="Year", values="FTE", aggfunc="sum").fillna(0)
+        sum_matrix.loc["Grand Total"] = sum_matrix.sum()
+    else:
+        sum_matrix = pd.DataFrame()
+
+    # --- BUILD TABLE 2: DETAIL BY TEAM ---
+    if detail_team_rows:
+        det_df = pd.DataFrame(detail_team_rows)
+        det_matrix = det_df.pivot_table(index=["Team", "Role"], columns="Year", values="FTE", aggfunc="sum").fillna(0)
+    else:
+        det_matrix = pd.DataFrame()
+
+    return sum_matrix, det_matrix
 
 
-def build_peak_headcount_by_program_table(results: dict, disciplines_map: dict):
-    long_data = []
+# --- NEW FUNCTION: DETAIL BY BUILDING TYPE ---
+def build_building_type_matrix(results, baseline_quantile):
+    rows = []
+
+    disc_map = {
+        "Commissioning Engineer": "CE",
+        "Mechanical Engineer": "ME",
+        "Electrical Engineer": "EE",
+        "Site Operations": "Ops Lead",
+        "Site Lead": "Site Lead",
+        "Installation": "Installers"
+    }
 
     for label, df_monthly in results.items():
-        if df_monthly is None or df_monthly.empty:
-            continue
+        if df_monthly is None or df_monthly.empty: continue
 
-        df = df_monthly.copy()
-        df["Year"] = df["Month"].dt.year
+        display_role = disc_map.get(label, label)
 
-        summary = (
-            df.groupby(["Year", "BuildingType"])["FTE"]
-            .max()
-            .reset_index()
-            .rename(columns={"FTE": label})
-        )
-        long_data.append(summary)
+        df_work = df_monthly.copy()
+        df_work["Year"] = df_work["Month"].dt.year
 
-    if not long_data:
+        # Calculate Peak FTE per Year/BuildingType/Role
+        monthly_sum = df_work.groupby(["Year", "Month", "BuildingType"], as_index=False)["FTE"].sum()
+        annual_peaks = monthly_sum.groupby(["Year", "BuildingType"], as_index=False)["FTE"].max()
+
+        for _, row in annual_peaks.iterrows():
+            year = row["Year"]
+            btype = row["BuildingType"]
+            peak_fte = row["FTE"]
+
+            if display_role == "Installers":
+                internal_fte = 0
+                contractor_fte = peak_fte
+            else:
+                internal_fte = peak_fte * baseline_quantile
+                contractor_fte = peak_fte - internal_fte
+
+            # Internal
+            if internal_fte > 0.05:
+                rows.append({
+                    "Building Type": btype,
+                    "Role": display_role,
+                    "Year": year,
+                    "FTE": internal_fte
+                })
+            # Contractor
+            if contractor_fte > 0.05:
+                c_role = "Installers" if display_role == "Installers" else "Internal Contractors"
+                rows.append({
+                    "Building Type": btype,
+                    "Role": c_role,
+                    "Year": year,
+                    "FTE": contractor_fte
+                })
+
+    if not rows:
         return pd.DataFrame()
 
-    long_df = pd.concat(long_data, ignore_index=True)
-    discipline_cols = [col for col in long_df.columns if col not in ["Year", "BuildingType"]]
-
-    long_df_melted = long_df.melt(
-        id_vars=["Year", "BuildingType"],
-        value_vars=discipline_cols,
-        var_name="Discipline",
-        value_name="Peak_FTE"
-    )
-
-    pivot_df = long_df_melted.pivot_table(
-        index=["Year", "BuildingType"],
-        columns="Discipline",
-        values="Peak_FTE"
-    ).fillna(0)
-
-    pivot_df['Program_Total_Peak'] = pivot_df.sum(axis=1)
-
-    return pivot_df
+    df = pd.DataFrame(rows)
+    # Pivot: Index=[Building Type, Role], Cols=Year
+    matrix = df.pivot_table(index=["Building Type", "Role"], columns="Year", values="FTE", aggfunc="sum").fillna(0)
+    return matrix
 
 
-def build_headcount_by_team_table(results: dict, baseline_method, baseline_quantile):
-    team_data = {}
-    non_ce_disciplines = ["Mechanical Engineer", "Electrical Engineer", "Site Operations", "Site Lead"]
+def build_team_monthly_data(results):
+    all_dfs = []
+    if "Commissioning Engineer" in results and results["Commissioning Engineer"] is not None:
+        df = results["Commissioning Engineer"].copy()
+        df["Team"] = "System Integration"
+        all_dfs.append(df[["Month", "Team", "FTE"]])
 
-    # --- 1. SIF Team (Commissioning Engineer) ---
-    df_sif_monthly = results.get("Commissioning Engineer")
-    if df_sif_monthly is not None and not df_sif_monthly.empty:
-        df_sif_monthly_agg = df_sif_monthly.groupby("Month", as_index=False)["FTE"].sum()
-        team_data["SIF (System Integration)"] = build_total_annual_summary(df_sif_monthly_agg, baseline_method,
-                                                                           baseline_quantile)
+    non_ce = ["Mechanical Engineer", "Electrical Engineer", "Site Operations", "Site Lead", "Installation"]
+    for label in non_ce:
+        if label in results and results[label] is not None:
+            df = results[label].copy()
 
-    # --- 2. ARS, SSD, and Projects Teams (Non-CE Trades) ---
-    df_non_ce_monthly_list = []
-    for label in non_ce_disciplines:
-        df = results.get(label)
-        if df is not None and not df.empty:
-            df_non_ce_monthly_list.append(df.copy())
+            def map_to_team(btype):
+                s = str(btype).upper()
+                if "ARS" in s: return "ARS Team"
+                if "SSD" in s: return "SSD Team"
+                if "IBIS" in s or "AUTOSTORE" in s: return "Projects Team"
+                return "Other"
 
-    if df_non_ce_monthly_list:
-        df_combined_monthly = pd.concat(df_non_ce_monthly_list, ignore_index=True)
+            df["Team"] = df["BuildingType"].apply(map_to_team)
+            all_dfs.append(df[["Month", "Team", "FTE"]])
 
-        def map_to_team(btype):
-            s = str(btype).upper()
-            if "ARS" in s:
-                return "ARS Team"
-            elif "SSD" in s:
-                return "SSD Team"
-            elif "IBIS" in s or "AUTOSTORE" in s:
-                return "Projects Team (IBIS/Autostore)"
-            return None
-
-        df_combined_monthly["Team"] = df_combined_monthly["BuildingType"].apply(map_to_team)
-
-        for team_name in ["ARS Team", "SSD Team", "Projects Team (IBIS/Autostore)"]:
-            df_team_monthly = df_combined_monthly[df_combined_monthly["Team"] == team_name]
-
-            if not df_team_monthly.empty:
-                df_team_monthly_agg = df_team_monthly.groupby("Month", as_index=False)["FTE"].sum()
-                team_summary = build_total_annual_summary(df_team_monthly_agg, baseline_method, baseline_quantile)
-                team_data[team_name] = team_summary
-
-    if not team_data:
-        return pd.DataFrame()
-
-    final_rows = []
-    for team_name, df_summary in team_data.items():
-        for year, row in df_summary.iterrows():
-            final_rows.append({
-                "Year": year,
-                "Team": team_name,
-                "Internal Headcount": row["Internal_Base"],
-                "Contractor Headcount": row["Contractor_Peak"],
-                "Total Peak FTE": row["Total_Peak"],
-                "Total Headcount": row["Internal_Base"] + row["Contractor_Peak"],
-            })
-
-    final_df = pd.DataFrame(final_rows).set_index(["Year", "Team"])
-    reshaped_df = final_df.unstack(level='Team').fillna(0)
-    reshaped_df.columns = reshaped_df.columns.swaplevel(0, 1)
-    reshaped_df = reshaped_df.sort_index(axis=1, level=0)
-
-    return reshaped_df
+    if not all_dfs: return pd.DataFrame()
+    return pd.concat(all_dfs, ignore_index=True).groupby(["Month", "Team"], as_index=False)["FTE"].sum()
 
 
-def build_project_master_list(por: pd.DataFrame, known_dates: pd.DataFrame, scenarios: pd.DataFrame,
-                              fallback_scen_name: str):
+def build_resource_breakdown_data(results):
+    all_dfs = []
+    disc_map = {"Commissioning Engineer": "CE", "Mechanical Engineer": "ME", "Electrical Engineer": "EE",
+                "Site Operations": "Ops", "Site Lead": "Lead", "Installation": "Install"}
+
+    if "Commissioning Engineer" in results and results["Commissioning Engineer"] is not None:
+        df = results["Commissioning Engineer"].copy()
+        df["Team"] = "System Integration"
+        df["Discipline"] = "CE"
+        all_dfs.append(df[["Month", "Team", "Discipline", "FTE"]])
+
+    non_ce = ["Mechanical Engineer", "Electrical Engineer", "Site Operations", "Site Lead", "Installation"]
+    for label in non_ce:
+        if label in results and results[label] is not None:
+            df = results[label].copy()
+
+            def map_to_team(btype):
+                s = str(btype).upper()
+                if "ARS" in s: return "ARS Team"
+                if "SSD" in s: return "SSD Team"
+                if "IBIS" in s or "AUTOSTORE" in s: return "Projects Team"
+                return "Other"
+
+            df["Team"] = df["BuildingType"].apply(map_to_team)
+            df["Discipline"] = disc_map.get(label, label)
+            all_dfs.append(df[["Month", "Team", "Discipline", "FTE"]])
+
+    if not all_dfs: return pd.DataFrame()
+    return pd.concat(all_dfs, ignore_index=True).groupby(["Month", "Team", "Discipline"], as_index=False)["FTE"].sum()
+
+
+def build_project_master_list(por, known_dates, scenarios, fallback_scen_name):
     master_list_rows = []
+    year_map = {}
+    for c in por.columns:
+        if str(c).isdigit(): year_map[int(c)] = c
+    years = sorted(year_map.keys())
 
     if fallback_scen_name not in scenarios['ScenarioName'].values:
         fallback_scen_name = scenarios['ScenarioName'].iloc[0]
@@ -480,88 +467,36 @@ def build_project_master_list(por: pd.DataFrame, known_dates: pd.DataFrame, scen
     if not known_dates.empty:
         for _, kd_row in known_dates.iterrows():
             key = (kd_row['BuildingType'], kd_row['Year'])
-            if key not in known_starts_map:
-                known_starts_map[key] = []
+            if key not in known_starts_map: known_starts_map[key] = []
             known_starts_map[key].append((kd_row['Project_ID'], kd_row['Go-Live Date']))
-
-    year_cols = [c for c in por.columns if str(c).isdigit()]
 
     for _, row in por.iterrows():
         btype = row["BuildingType"]
-
-        for y_str in year_cols:
-            y = int(y_str)
-            launches = row[y_str]
+        for y in years:
+            actual_col = year_map[y]
+            launches = row[actual_col]
             if pd.isna(launches) or launches == 0: continue
             launches = int(launches)
 
             known_launches = known_starts_map.get((btype, y), [])
             num_known = len(known_launches)
-
             go_live_months = assign_go_live_months_quarter_based(launches, y, q_shares)
 
-            # 1. Known Projects
             for i in range(num_known):
-                known_id, go_live_date = known_launches[i]
-                master_list_rows.append({
-                    'Building Type': btype,
-                    'Project ID': known_id,
-                    'Go-Live Date': go_live_date.strftime('%Y-%m-%d'),
-                    'Source': 'Known Date',
-                })
-
-            # 2. Unknown Projects (Fallback)
+                master_list_rows.append({'Building Type': btype, 'Project ID': known_launches[i][0],
+                                         'Go-Live Date': known_launches[i][1].strftime('%Y-%m-%d'),
+                                         'Source': 'Known Date'})
             for i in range(num_known, launches):
                 if i >= len(go_live_months): continue
-
                 gy, gm = go_live_months[i]
-                scheduled_go_live_date = pd.Timestamp(year=gy, month=gm, day=1)
-
-                master_list_rows.append({
-                    'Building Type': btype,
-                    'Project ID': f"{btype}-{y}-{i + 1}",
-                    'Go-Live Date': scheduled_go_live_date.strftime('%Y-%m-%d'),
-                    'Source': f'Fallback ({fallback_scen_name})',
-                })
+                scheduled = pd.Timestamp(year=gy, month=gm, day=1)
+                master_list_rows.append({'Building Type': btype, 'Project ID': f"{btype}-{y}-{i + 1}",
+                                         'Go-Live Date': scheduled.strftime('%Y-%m-%d'),
+                                         'Source': f'Fallback ({fallback_scen_name})'})
 
     final_df = pd.DataFrame(master_list_rows)
+    if final_df.empty: return pd.DataFrame(columns=['Building Type', 'Project ID', 'Go-Live Date', 'Source'])
     return final_df[['Building Type', 'Project ID', 'Go-Live Date', 'Source']].sort_values('Go-Live Date')
-
-
-# NEW FUNCTION: Build Aggregated Monthly Data for Charting
-def build_team_monthly_data(results: dict):
-    all_dfs = []
-
-    # 1. System Integration
-    if "Commissioning Engineer" in results and results["Commissioning Engineer"] is not None:
-        df = results["Commissioning Engineer"].copy()
-        df["Team"] = "System Integration"
-        all_dfs.append(df[["Month", "Team", "FTE"]])
-
-    # 2. ARS, SSD, Projects
-    non_ce_disciplines = ["Mechanical Engineer", "Electrical Engineer", "Site Operations", "Site Lead"]
-    for label in non_ce_disciplines:
-        if label in results and results[label] is not None:
-            df = results[label].copy()
-
-            def map_to_team(btype):
-                s = str(btype).upper()
-                if "ARS" in s: return "ARS"
-                if "SSD" in s: return "SSD"
-                if "IBIS" in s or "AUTOSTORE" in s: return "Projects"
-                return "Other"
-
-            df["Team"] = df["BuildingType"].apply(map_to_team)
-            # Filter out 'Other' if necessary, or keep it
-            all_dfs.append(df[["Month", "Team", "FTE"]])
-
-    if not all_dfs:
-        return pd.DataFrame()
-
-    full_df = pd.concat(all_dfs, ignore_index=True)
-    # Group by Month and Team
-    grouped_df = full_df.groupby(["Month", "Team"], as_index=False)["FTE"].sum()
-    return grouped_df
 
 
 # ---------------------------------------------------
@@ -571,34 +506,22 @@ def build_team_monthly_data(results: dict):
 def main():
     st.title("MHE Integration Staffing Plan")
 
-    # ---------------- Sidebar: Input File ----------------
     st.sidebar.header("1. Input Data Source")
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload commissioning_input.xlsx",
-        type=["xlsx"],
-        help="Requires POR, Scenario_Params, KNOWN_DATES, and assumption sheets."
-    )
+    uploaded_file = st.sidebar.file_uploader("Upload commissioning_input.xlsx", type=["xlsx"])
 
     if uploaded_file is None:
-        st.warning("Please upload your input Excel file in the sidebar to begin.")
+        st.warning("Please upload your input Excel file to begin.")
         return
 
     por, scenarios, assumptions_dict, known_dates = load_inputs_from_excel(uploaded_file)
-
     if por is None or scenarios is None:
         st.error("Error loading core data.")
         return
-    if not assumptions_dict:
-        st.warning("No valid assumption sheets found.")
 
-    # ---------------- Sidebar: Filters ----------------
     st.sidebar.header("2. Configuration")
-
     raw_options = scenarios["ScenarioName"].dropna().unique()
     scenario_options = [x for x in raw_options if str(x).strip() != ""]
-
-    if not known_dates.empty:
-        scenario_options.insert(0, "HYBRID")
+    if not known_dates.empty: scenario_options.insert(0, "HYBRID")
 
     selected_scen = st.sidebar.selectbox("Select Scenario to Analyze", options=scenario_options)
 
@@ -607,131 +530,110 @@ def main():
         st.sidebar.markdown('**Hybrid Fallback:**')
         fallback_options = [x for x in scenarios["ScenarioName"].dropna().unique() if str(x).strip() != ""]
         default_index = 0
-        if "LEVEL_LOAD" in fallback_options:
-            default_index = list(fallback_options).index("LEVEL_LOAD")
-
-        fallback_choice = st.sidebar.selectbox(
-            "Select Fallback Schedule",
-            options=fallback_options,
-            index=default_index
-        )
+        if "LEVEL_LOAD" in fallback_options: default_index = list(fallback_options).index("LEVEL_LOAD")
+        fallback_choice = st.sidebar.selectbox("Select Fallback Schedule", options=fallback_options,
+                                               index=default_index)
     else:
         fallback_choice = selected_scen
 
     st.sidebar.header("3. Internal Staffing Strategy")
-    baseline_choice = st.sidebar.selectbox("Baseline Headcount Rule", ["Lean (P50)", "Moderate (P70)", "Robust (P90)"],
-                                           index=1)
-    b_map = {"Lean (P50)": 0.5, "Moderate (P70)": 0.7, "Robust (P90)": 0.9}
+    # CHANGED DEFAULT TO P100 (Index 3)
+    baseline_choice = st.sidebar.selectbox(
+        "Baseline Headcount Rule",
+        ["Lean (P50)", "Moderate (P70)", "Robust (P90)", "Max (P100)"],
+        index=3
+    )
+    b_map = {"Lean (P50)": 0.5, "Moderate (P70)": 0.7, "Robust (P90)": 0.9, "Max (P100)": 1.0}
     baseline_quantile = b_map[baseline_choice]
-    baseline_method = 'quantile'
 
     if selected_scen != 'HYBRID':
         filtered_scenarios = scenarios[scenarios["ScenarioName"] == selected_scen].copy()
     else:
         filtered_scenarios = scenarios[scenarios["ScenarioName"] == fallback_choice].copy()
 
-    # ---------------- Processing ----------------
     disciplines_map = {
         "Commissioning Engineer": ("CE", "CE"),
         "Mechanical Engineer": ("ME", "ME"),
         "Electrical Engineer": ("EE", "EE"),
         "Site Operations": ("SITEOPS", "SITEOPS"),
         "Site Lead": ("LEAD", "LEAD"),
+        "Installation": ("INSTALL", "INSTALL")
     }
 
-    annual_summaries = {}
     results = {}
-
     for label, (prefix, sheet_key) in disciplines_map.items():
         df_assump = assumptions_dict.get(sheet_key)
         if df_assump is not None:
-            monthly_data = build_monthly_labor_detailed(
+            results[label] = build_monthly_labor_detailed(
                 por, df_assump, filtered_scenarios, prefix,
                 known_dates, fallback_choice, selected_scen
             ).get(selected_scen)
 
-            results[label] = monthly_data
+    # ---------------- SUMMARY TABLES ----------------
+    st.header("Consolidated Hiring Plan")
+    st.caption(f"Strategy: {baseline_choice}. (Installers are always allocated to Contractors).")
 
-            if monthly_data is not None and not monthly_data.empty:
-                annual_summaries[prefix] = build_total_annual_summary(monthly_data, baseline_method, baseline_quantile)
+    summary_df, detail_team_df = build_split_matrices(results, baseline_quantile)
 
-    # ---------------- CONSOLIDATED HIRING DEMAND ----------------
-    st.header("Consolidated Hiring Demand")
-    if annual_summaries:
-        por_summary = build_por_summary(por)
-        consolidated_df = build_consolidated_report(por_summary, annual_summaries, selected_scen)
-        st.dataframe(consolidated_df.style.format("{:.1f}"), use_container_width=True)
+    st.subheader("1. Executive Summary (Internal vs Contractor)")
+    if not summary_df.empty:
+        st.dataframe(summary_df.style.format("{:.1f}"), use_container_width=True)
+    else:
+        st.warning("No summary data available.")
+
+    st.subheader("2. Detailed Role Breakdown (by Team)")
+    if not detail_team_df.empty:
+        st.dataframe(detail_team_df.style.format("{:.1f}"), use_container_width=True)
+    else:
+        st.warning("No detailed team data available.")
+
+    # NEW TABLE
+    st.subheader("3. Detailed Role Breakdown (by Building Type)")
+    detail_building_df = build_building_type_matrix(results, baseline_quantile)
+    if not detail_building_df.empty:
+        st.dataframe(detail_building_df.style.format("{:.1f}"), use_container_width=True)
+    else:
+        st.warning("No detailed building type data available.")
 
     st.markdown("---")
 
     # ---------------- TOTAL HEADCOUNT CHART ----------------
     st.header("Total Headcount by Team (Graph)")
     team_monthly_df = build_team_monthly_data(results)
-
     if not team_monthly_df.empty:
-        # Create a selection for interactivity
         selection = alt.selection_point(fields=['Team'], bind='legend')
-
         chart_team = alt.Chart(team_monthly_df).mark_area().encode(
-            x='Month',
-            y='FTE',
-            color=alt.Color('Team', scale=alt.Scale(scheme='category10')),
-            tooltip=['Month', 'Team', 'FTE'],
-            opacity=alt.condition(selection, alt.value(1), alt.value(0.2))
-        ).add_params(
-            selection
-        ).properties(
-            height=400
-        )
+            x='Month', y='FTE', color=alt.Color('Team', scale=alt.Scale(scheme='category10')),
+            tooltip=['Month', 'Team', 'FTE'], opacity=alt.condition(selection, alt.value(1), alt.value(0.2))
+        ).add_params(selection).properties(height=400)
         st.altair_chart(chart_team, use_container_width=True)
-    else:
-        st.info("No data available for team graphing.")
+
+    st.markdown("---")
+
+    # ---------------- RESOURCE BREAKDOWN BY TEAM ----------------
+    st.header("Resource Breakdown by Team (Graph)")
+    resource_df = build_resource_breakdown_data(results)
+    if not resource_df.empty:
+        all_teams = sorted(resource_df['Team'].unique())
+        selected_team = st.selectbox("Select Team to Inspect", all_teams)
+        filtered_res = resource_df[resource_df['Team'] == selected_team]
+        chart_res = alt.Chart(filtered_res).mark_area().encode(
+            x='Month', y='FTE', color=alt.Color('Discipline', scale=alt.Scale(scheme='set2')),
+            tooltip=['Month', 'Discipline', 'FTE']
+        ).properties(title=f"Role Composition for {selected_team}", height=350)
+        st.altair_chart(chart_res, use_container_width=True)
 
     st.markdown("---")
 
     # ---------------- PROJECT MASTER LIST ----------------
     st.header("Project Master List (POR Detail)")
-    st.caption("Detailed view of all scheduled projects. Known dates are prioritized; others are forecasted.")
-
     project_master_df = build_project_master_list(por, known_dates, scenarios, fallback_choice)
-
     if not project_master_df.empty:
         st.dataframe(project_master_df, use_container_width=True)
     else:
-        st.info("No projects found in the Plan of Record (POR).")
+        st.info("No projects found in POR.")
 
     st.markdown("---")
-
-    # ---------------- HEADCOUNT BY ORGANIZATIONAL TEAM ----------------
-    st.header("Headcount by Organizational Team (Table)")
-    team_headcount_df = build_headcount_by_team_table(results, baseline_method, baseline_quantile)
-    if not team_headcount_df.empty:
-        st.dataframe(team_headcount_df.style.format("{:.1f}"), use_container_width=True)
-
-    st.markdown("---")
-
-    # ---------------- PEAK HEADCOUNT BY PROGRAM ----------------
-    st.header("Peak Headcount by Program")
-    peak_program_df = build_peak_headcount_by_program_table(results, disciplines_map)
-    if not peak_program_df.empty:
-        st.dataframe(peak_program_df.style.format("{:.1f}"), use_container_width=True)
-
-    st.markdown("---")
-
-    # ---------------- Monthly Demand Charts ----------------
-    st.subheader("Monthly Demand Visuals (Detailed)")
-    for label, df_monthly in results.items():
-        if df_monthly is None or df_monthly.empty: continue
-        st.markdown(f"### {label} FTE Demand")
-
-        chart = alt.Chart(df_monthly).mark_bar().encode(
-            x='Month', y='FTE', color='BuildingType', tooltip=['Month', 'BuildingType', 'FTE']
-        )
-        st.altair_chart(chart, use_container_width=True)
-
-        with st.expander(f"View Data for {label}"):
-            st.dataframe(df_monthly.groupby('Month')['FTE'].sum().reset_index(), use_container_width=True)
-        st.markdown("---")
 
     # ---------------- ASSUMPTIONS ----------------
     with st.expander("Show/Hide Input Assumptions"):
