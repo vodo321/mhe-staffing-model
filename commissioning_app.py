@@ -225,10 +225,11 @@ def build_monthly_labor_detailed(por: pd.DataFrame,
 
     if rows:
         df = pd.DataFrame(rows)
-        df_agg = df.groupby(["Month", "BuildingType", "Scenario"], as_index=False).agg(
-            {"FTE": "sum", "Active_Projects": "sum"}).sort_values("Month")
+        # UPDATED: Group by Project_ID to preserve project-level detail
+        df_agg = df.groupby(["Month", "BuildingType", "Project_ID", "Scenario"], as_index=False).agg(
+            {"FTE": "sum"}).sort_values("Month")
     else:
-        df_agg = pd.DataFrame(columns=["Month", "BuildingType", "FTE", "Active_Projects", "Scenario"])
+        df_agg = pd.DataFrame(columns=["Month", "BuildingType", "Project_ID", "FTE", "Scenario"])
 
     monthly_by_scen[selected_scen_name] = df_agg
     return monthly_by_scen
@@ -293,7 +294,6 @@ def build_split_matrices(results, baseline_quantile):
                 summary_rows.append({"Category": "Total Contractors", "Year": year, "FTE": contractor_fte})
 
             # --- 2. POPULATE DETAIL DATA (Team/Role) ---
-            # Internal Portion
             if internal_fte > 0.05:
                 detail_team_rows.append({
                     "Team": team,
@@ -301,7 +301,6 @@ def build_split_matrices(results, baseline_quantile):
                     "Year": year,
                     "FTE": internal_fte
                 })
-            # Contractor Portion (Specific Role logic)
             if contractor_fte > 0.05:
                 c_role = "Installers" if display_role == "Installers" else "Internal Contractors"
                 detail_team_rows.append({
@@ -329,7 +328,7 @@ def build_split_matrices(results, baseline_quantile):
     return sum_matrix, det_matrix
 
 
-# --- NEW FUNCTION: DETAIL BY BUILDING TYPE ---
+# --- DETAIL BY BUILDING TYPE ---
 def build_building_type_matrix(results, baseline_quantile):
     rows = []
 
@@ -350,7 +349,6 @@ def build_building_type_matrix(results, baseline_quantile):
         df_work = df_monthly.copy()
         df_work["Year"] = df_work["Month"].dt.year
 
-        # Calculate Peak FTE per Year/BuildingType/Role
         monthly_sum = df_work.groupby(["Year", "Month", "BuildingType"], as_index=False)["FTE"].sum()
         annual_peaks = monthly_sum.groupby(["Year", "BuildingType"], as_index=False)["FTE"].max()
 
@@ -366,7 +364,6 @@ def build_building_type_matrix(results, baseline_quantile):
                 internal_fte = peak_fte * baseline_quantile
                 contractor_fte = peak_fte - internal_fte
 
-            # Internal
             if internal_fte > 0.05:
                 rows.append({
                     "Building Type": btype,
@@ -374,7 +371,6 @@ def build_building_type_matrix(results, baseline_quantile):
                     "Year": year,
                     "FTE": internal_fte
                 })
-            # Contractor
             if contractor_fte > 0.05:
                 c_role = "Installers" if display_role == "Installers" else "Internal Contractors"
                 rows.append({
@@ -388,9 +384,64 @@ def build_building_type_matrix(results, baseline_quantile):
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-    # Pivot: Index=[Building Type, Role], Cols=Year
     matrix = df.pivot_table(index=["Building Type", "Role"], columns="Year", values="FTE", aggfunc="sum").fillna(0)
     return matrix
+
+
+# --- NEW: PROJECT LEVEL DETAIL MATRIX (INCLUDES DATES) ---
+def build_project_level_matrix(results, baseline_quantile, included_roles, view_mode, master_project_df):
+    dfs = []
+
+    for label, df in results.items():
+        if label not in included_roles or df is None or df.empty:
+            continue
+
+        temp = df.copy()
+        temp['Year'] = temp['Month'].dt.year
+
+        if label == "Installation":
+            temp['Internal'] = 0
+            temp['Contractor'] = temp['FTE']
+        else:
+            temp['Internal'] = temp['FTE'] * baseline_quantile
+            temp['Contractor'] = temp['FTE'] - temp['Internal']
+
+        if view_mode == "Internal":
+            temp['Value'] = temp['Internal']
+        elif view_mode == "Contractor":
+            temp['Value'] = temp['Contractor']
+        else:  # Total
+            temp['Value'] = temp['FTE']
+
+        dfs.append(temp[['Year', 'BuildingType', 'Project_ID', 'Month', 'Value']])
+
+    if not dfs:
+        return pd.DataFrame()
+
+    combined = pd.concat(dfs, ignore_index=True)
+
+    # 1. Sum across selected roles for each Project/Month
+    monthly_sum = combined.groupby(['Year', 'BuildingType', 'Project_ID', 'Month'], as_index=False)['Value'].sum()
+
+    # 2. Get Peak Headcount for that project in that year
+    annual_peak = monthly_sum.groupby(['Year', 'BuildingType', 'Project_ID'], as_index=False)['Value'].max()
+
+    # 3. Pivot
+    matrix = annual_peak.pivot_table(index=['BuildingType', 'Project_ID'], columns='Year', values='Value',
+                                     aggfunc='sum').fillna(0)
+
+    # 4. MERGE GO-LIVE DATE
+    matrix = matrix.reset_index()
+    # Merge with Master List (on Project_ID) to get the date
+    merged = pd.merge(matrix, master_project_df[['Project ID', 'Go-Live Date']], left_on='Project_ID',
+                      right_on='Project ID', how='left')
+
+    # Clean up columns
+    merged['Go-Live Date'] = pd.to_datetime(merged['Go-Live Date']).dt.date  # Remove time component
+    cols = [c for c in matrix.columns if isinstance(c, int)]  # Years
+    final_cols = ['BuildingType', 'Project_ID', 'Go-Live Date'] + cols
+
+    return merged[final_cols].set_index(['BuildingType', 'Project_ID', 'Go-Live Date'])
 
 
 def build_team_monthly_data(results):
@@ -587,7 +638,6 @@ def main():
     else:
         st.warning("No detailed team data available.")
 
-    # NEW TABLE
     st.subheader("3. Detailed Role Breakdown (by Building Type)")
     detail_building_df = build_building_type_matrix(results, baseline_quantile)
     if not detail_building_df.empty:
@@ -610,6 +660,32 @@ def main():
 
     st.markdown("---")
 
+    # ---------------- NEW: DETAILED PROJECT VIEW ----------------
+    st.header("4. Detailed Project View")
+    st.caption("See headcount assigned to specific projects.")
+
+    # GENERATE MASTER LIST FIRST to get Dates
+    project_master_df = build_project_master_list(por, known_dates, scenarios, fallback_choice)
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        view_mode = st.radio("Headcount Type:", ["Total", "Internal", "Contractor"], horizontal=True)
+    with col2:
+        available_roles = list(results.keys())
+        selected_roles = st.multiselect("Filter Job Roles:", available_roles, default=available_roles)
+
+    if not project_master_df.empty:
+        project_level_df = build_project_level_matrix(results, baseline_quantile, selected_roles, view_mode,
+                                                      project_master_df)
+        if not project_level_df.empty:
+            st.dataframe(project_level_df.style.format("{:.1f}"), use_container_width=True)
+        else:
+            st.info("No data for the selected filters.")
+    else:
+        st.warning("POR is empty.")
+
+    st.markdown("---")
+
     # ---------------- RESOURCE BREAKDOWN BY TEAM ----------------
     st.header("Resource Breakdown by Team (Graph)")
     resource_df = build_resource_breakdown_data(results)
@@ -627,7 +703,6 @@ def main():
 
     # ---------------- PROJECT MASTER LIST ----------------
     st.header("Project Master List (POR Detail)")
-    project_master_df = build_project_master_list(por, known_dates, scenarios, fallback_choice)
     if not project_master_df.empty:
         st.dataframe(project_master_df, use_container_width=True)
     else:
