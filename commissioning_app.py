@@ -225,7 +225,7 @@ def build_monthly_labor_detailed(por: pd.DataFrame,
 
     if rows:
         df = pd.DataFrame(rows)
-        # UPDATED: Group by Project_ID to preserve project-level detail
+        # Group by Project_ID to preserve project-level detail
         df_agg = df.groupby(["Month", "BuildingType", "Project_ID", "Scenario"], as_index=False).agg(
             {"FTE": "sum"}).sort_values("Month")
     else:
@@ -388,7 +388,7 @@ def build_building_type_matrix(results, baseline_quantile):
     return matrix
 
 
-# --- NEW: PROJECT LEVEL DETAIL MATRIX (INCLUDES DATES) ---
+# --- NEW: PROJECT LEVEL DETAIL MATRIX (INCLUDES DATES & SORT) ---
 def build_project_level_data(results, baseline_quantile, included_roles, view_mode, master_project_df):
     dfs = []
 
@@ -416,18 +416,18 @@ def build_project_level_data(results, baseline_quantile, included_roles, view_mo
         dfs.append(temp[['Year', 'BuildingType', 'Project_ID', 'Month', 'Value']])
 
     if not dfs:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
     combined = pd.concat(dfs, ignore_index=True)
 
-    # 1. Sum across selected roles for each Project/Month (To get Project Curve)
+    # 1. Sum across selected roles for each Project/Month
     project_monthly_curve = combined.groupby(['Year', 'BuildingType', 'Project_ID', 'Month'], as_index=False)[
         'Value'].sum()
 
-    # 2. Get Peak Headcount for that project in that year (For Table)
+    # 2. Get Peak Headcount for that project in that year
     annual_peak = project_monthly_curve.groupby(['Year', 'BuildingType', 'Project_ID'], as_index=False)['Value'].max()
 
-    # 3. Pivot for Table
+    # 3. Pivot
     matrix = annual_peak.pivot_table(index=['BuildingType', 'Project_ID'], columns='Year', values='Value',
                                      aggfunc='sum').fillna(0)
 
@@ -436,15 +436,14 @@ def build_project_level_data(results, baseline_quantile, included_roles, view_mo
     merged = pd.merge(matrix, master_project_df[['Project ID', 'Go-Live Date']], left_on='Project_ID',
                       right_on='Project ID', how='left')
     merged['Go-Live Date'] = pd.to_datetime(merged['Go-Live Date']).dt.date
+
+    # 5. SORT BY GO-LIVE DATE
+    merged = merged.sort_values('Go-Live Date')
+
     cols = [c for c in matrix.columns if isinstance(c, int)]
     final_cols = ['BuildingType', 'Project_ID', 'Go-Live Date'] + cols
 
-    # --- CONCURRENT PEAK CALCULATION (For Metrics) ---
-    # To get True Peak, we must sum ALL projects for a specific month, THEN take max of year
-    aggregate_monthly_curve = project_monthly_curve.groupby(['Year', 'Month'], as_index=False)['Value'].sum()
-    concurrent_peaks = aggregate_monthly_curve.groupby('Year')['Value'].max()
-
-    return merged[final_cols].set_index(['BuildingType', 'Project_ID', 'Go-Live Date']), concurrent_peaks
+    return merged[final_cols].set_index(['BuildingType', 'Project_ID', 'Go-Live Date'])
 
 
 def build_team_monthly_data(results):
@@ -672,7 +671,7 @@ def main():
     # GENERATE MASTER LIST FIRST to get Dates
     project_master_df = build_project_master_list(por, known_dates, scenarios, fallback_choice)
 
-    col1, col2 = st.columns([1, 2])
+    col1, col2, col3 = st.columns([1, 2, 1])
     with col1:
         view_mode = st.radio("Headcount Type:", ["Total", "Internal", "Contractor"], horizontal=True)
     with col2:
@@ -680,25 +679,19 @@ def main():
         selected_roles = st.multiselect("Filter Job Roles:", available_roles, default=available_roles)
 
     if not project_master_df.empty:
-        project_level_df, concurrent_peaks = build_project_level_data(results, baseline_quantile, selected_roles,
-                                                                      view_mode, project_master_df)
+        project_level_df = build_project_level_data(results, baseline_quantile, selected_roles, view_mode,
+                                                    project_master_df)
 
         if not project_level_df.empty:
-            # SHOW METRICS FOR COMPARISON
-            year_cols = [c for c in project_level_df.columns if isinstance(c, int)]
-            if year_cols:
-                disp_year = year_cols[0]
-                sum_of_peaks = project_level_df[disp_year].sum()
-                true_peak = concurrent_peaks.get(disp_year, 0)
+            # YEAR FILTER
+            available_years = sorted([c for c in project_level_df.columns if isinstance(c, int)])
+            with col3:
+                selected_years = st.multiselect("Filter Years:", available_years, default=available_years)
 
-                m1, m2 = st.columns(2)
-                m1.metric(f"Total Gross Demand (Sum of Peaks) in {disp_year}", f"{sum_of_peaks:.1f}",
-                          help="Simple sum of all project requirements.")
-                m2.metric(f"Net Concurrent Demand (True Peak) in {disp_year}", f"{true_peak:.1f}",
-                          delta=f"{sum_of_peaks - true_peak:.1f} Saved via Staggering", delta_color="inverse",
-                          help="Actual headcount needed accounting for staggering.")
-
-            st.dataframe(project_level_df.style.format("{:.1f}"), use_container_width=True)
+            if selected_years:
+                st.dataframe(project_level_df[selected_years].style.format("{:.1f}"), use_container_width=True)
+            else:
+                st.warning("Please select at least one year to view.")
         else:
             st.info("No data for the selected filters.")
     else:
